@@ -1,0 +1,184 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  security-scan:
+    name: Security Scanning
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 0
+      
+      - name: Validate commit signatures
+        run: |
+          git log --show-signature -n 10
+
+      - name: Secret scanning
+        uses: gitleaks/gitleaks-action@44c470ffc35caa8b1eb3e8012ca53c2f9bea4eb5
+        with:
+          config-path: .gitleaks.toml
+
+      - name: SAST scanning
+        uses: github/codeql-action/analyze@6bb031afdd8eb862ea3fc1848194185e076637e5
+        with:
+          languages: python, javascript
+      
+      - name: Dependency scanning
+        run: |
+          python -m pip install safety
+          safety check -r app/requirements.txt --json > safety-report.json
+
+      - name: Infrastructure-as-Code scanning
+        uses: aquasecurity/tfsec-action@b466648d6e39e7c75324f25d83891162a721f2d6
+        with:
+          soft_fail: false
+  build:
+    name: Build and Test
+    needs: security-scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      - name: Set up Python
+        uses: actions/setup-python@42375524e23c412d93fb67b49958b491fce71c38
+        with:
+          python-version: '3.9'
+          cache: 'pip'
+      
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f app/requirements.txt ]; then pip install -r app/requirements.txt; fi
+          pip install pytest pytest-cov bandit
+
+      - name: Run tests
+        run: |
+          pytest --cov=app tests/
+          bandit -r app/
+
+      - name: Upload test coverage
+        uses: actions/upload-artifact@4cec3d8aa04e39d1a68397de0c4cd6fb9dce8ec1
+        with:
+          name: coverage
+      
+      - name: Upload bandit report
+        uses: actions/upload-artifact@4cec3d8aa04e39d1a68397de0c4cd6fb9dce8ec1
+        with:
+          name: bandit-report
+      
+      - name: Build Docker image
+        run: |
+          docker build -t app:${{ github.sha }} \
+            --build-arg BUILD_DATE=$(date -u +'%Y-%m-%dT%H:%M:%SZ') \
+            --build-arg VCS_REF=${{ github.sha }} \
+            --build-arg VERSION=${{ github.ref_name }} \
+            --no-cache \
+            app/
+
+      - name: Verify Docker image integrity
+        run: |
+          docker pull ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.ap-southeast-1.amazonaws.com/app:${{ github.sha }}
+          docker image inspect app:${{ github.sha }}
+          echo "Docker image inspected successfully"
+
+      - name: Scan Docker image
+        uses: aquasecurity/trivy-action@18f2510ee396bbf400402947b394f2dd8c87dbb0
+        with:
+          image-ref: 'app:${{ github.sha }}'
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+          severity: 'CRITICAL,HIGH'
+          exit-code: '1'
+          ignore-unfixed: true
+      
+      - name: Upload artifact
+        uses: actions/upload-artifact@4cec3d8aa04e39d1a68397de0c4cd6fb9dce8ec1
+        with:
+          name: app-image
+          path: |
+            trivy-results.sarif
+            safety-report.json
+  deploy-staging:
+    name: Deploy to Staging
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: staging
+      url: ${{ secrets.STAGING_API_BASE_URL }}
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@4cec3d8aa04e39d1a68397de0c4cd6fb9dce8ec1
+        with:
+          name: app-image
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@ececac1a45f3b08a01d2dd070d28d111c5fe6722
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@5a88a04c91d5c6f97aae0d9be790e64d9b1d47b7
+
+      - name: Deploy to ECS
+        run: |
+          kubectl config use-context staging
+          kubectl apply -f kubernetes/staging/deployment.yaml
+          kubectl rollout status deployment/app-deployment -n staging
+
+      - name: Run DAST scan
+        uses: zaproxy/action-full-scan@75ee1686750ab1511a73b26b77a2aedd295053ed
+        with:
+          target: '${{ secrets.STAGING_API_BASE_URL }}'
+          policy: 'Light'
+  deploy-production:
+    name: Deploy to Production
+    needs: deploy-staging
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+      url: ${{ secrets.API_BASE_URL }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@ececac1a45f3b08a01d2dd070d28d111c5fe6722
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ secrets.AWS_REGION }}
+          
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@5a88a04c91d5c6f97aae0d9be790e64d9b1d47b7
+        
+      - name: Deploy to production
+        run: |
+          kubectl config use-context production
+          kubectl apply -f kubernetes/production/deployment.yaml
+          kubectl rollout status deployment/app-deployment -n production
+          
+      - name: Verify deployment
+        run: |
+          # Run smoke tests
+          curl -s ${{ secrets.API_BASE_URL }}/health | grep "ok"
+          
+      - name: Send deployment notification
+        uses: slackapi/slack-github-action@485a9d42d3a73031f12ec201c457e2162c45d02d
+        with:
+          payload: |
+            {
+              "text": "Deployment to production completed successfully: ${{ github.repository }}@${{ github.sha }}"
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
